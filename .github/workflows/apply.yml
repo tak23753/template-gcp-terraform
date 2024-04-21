@@ -1,0 +1,108 @@
+name: Terraform apply
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+    types:
+      - closed
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  DEV_AWS_ACCOUNT_ID: ${{ secrets.DEV_AWS_ACCOUNT_ID }}
+  PROD_AWS_ACCOUNT_ID: ${{ secrets.PROD_AWS_ACCOUNT_ID }}
+  DEV_DOMAIN_NAME: ${{ vars.DEV_DOMAIN_NAME }}
+  PROD_DOMAIN_NAME: ${{ vars.PROD_DOMAIN_NAME }}
+  TERRAFORM_MODULES_REPO_SSH_KEY: ${{ secrets.TERRAFORM_MODULES_REPO_SSH_KEY }}
+  TF_VAR_system: ${{ vars.SYSTEM }}
+  TF_VAR_backend_git_repository_name: ${{ vars.BACKEND_GIT_REPOSITORY_NAME }}
+  TF_VAR_frontend_git_repository_name: ${{ vars.FRONTEND_GIT_REPOSITORY_NAME }}
+  TF_VAR_terraform_git_repository_name: ${{ vars.TERRAFORM_GIT_REPOSITORY_NAME }}
+  TF_VAR_slack_channel_id: ${{ secrets.SLACK_CHANNEL_ID }}
+  TF_VAR_slack_workspace_id: ${{ secrets.SLACK_WORKSPACE_ID }}
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  notify-started:
+    if: github.event.pull_request.merged == true && startsWith(github.head_ref, 'renovate/') == false
+    uses: tak23753/reusable-workflows/.github/workflows/notify_started.yml@main
+    secrets: inherit
+
+  apply:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ env.TERRAFORM_MODULES_REPO_SSH_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup aqua
+        uses: aquaproj/aqua-installer@v2.2.0
+        with:
+          aqua_version: v2.17.0
+          aqua_opts: ""
+
+      - name: Set env vars for dev
+        if: github.base_ref == 'develop'
+        run: |
+          echo "AWS_ACCOUNT_ID=$DEV_AWS_ACCOUNT_ID" >> $GITHUB_ENV
+          echo "TF_VAR_environment=dev" >> $GITHUB_ENV
+          echo "TF_VAR_domain_name=$DEV_DOMAIN_NAME" >> $GITHUB_ENV
+
+      - name: Set env vars for prod
+        if: github.base_ref == 'main'
+        run: |
+          echo "AWS_ACCOUNT_ID=$PROD_AWS_ACCOUNT_ID" >> $GITHUB_ENV
+          echo "TF_VAR_environment=prod" >> $GITHUB_ENV
+          echo "TF_VAR_domain_name=$PROD_DOMAIN_NAME" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/${{ env.TF_VAR_system  }}-${{ env.TF_VAR_environment }}-github-actions-terraform-role
+          role-session-name: ${{ env.TF_VAR_system  }}-${{ env.TF_VAR_environment }}-github-actions-terraform-session
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Config Terraform plugin cache
+        run: |
+          echo 'plugin_cache_dir="$HOME/.terraform.d/plugin-cache"' >~/.terraformrc
+          mkdir --parents ~/.terraform.d/plugin-cache
+
+      - name: Cache Terraform Plugins
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.terraform.d/plugin-cache
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-
+
+      - name: Terraform init
+        working-directory: envs/${{ env.TF_VAR_environment }}
+        run: |
+          terraform init
+
+      - name: Terraform apply
+        working-directory: envs/${{ env.TF_VAR_environment }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tfcmt -var "target:${TF_VAR_environment}" apply -- terraform apply -auto-approve -lock-timeout=5m
+
+  notify-finished:
+    needs: apply
+    if: always() && startsWith(github.head_ref, 'renovate/') == false
+    uses: tak23753/reusable-workflows/.github/workflows/notify_finished.yml@main
+    secrets: inherit
